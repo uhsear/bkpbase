@@ -53,8 +53,8 @@ DEFAULT_MAX_AGE_HOURS = 26.0
 # backupmediafamily.device_type values. Only disk and URL hold the backup in a
 # file that RESTORE DATABASE reads directly.
 NATIVE_DEVICES = (2, 9)
-DEVICE_NAMES = {2: "disk", 5: "tape", 7: "virtual device", 9: "URL",
-                105: "permanent backup device"}
+DEVICE_NAMES = {2: "disk", 5: "tape", 7: "virtual device",
+                9: "Azure Storage", 105: "permanent backup device"}
 
 RECOVERY_MODELS = ("FULL", "BULK-LOGGED", "SIMPLE")
 
@@ -105,7 +105,9 @@ class ExportError(ValueError):
 
 _WHEN = re.compile(r"^\s*([0-9]{4})-([0-9]{2})-([0-9]{2})[ T]([0-9]{2}):([0-9]{2})"
                    r"(?::([0-9]{2})(?:\.([0-9]{1,7}))?)?\s*$")
-_INT = re.compile(r"^\s*-?[0-9]+\s*$")
+# At most 18 digits: a longer string would make int() raise on Python 3.11+, and
+# no msdb id, position or device type comes near it.
+_INT = re.compile(r"^\s*-?[0-9]{1,18}\s*$")
 _BITS = {"1": True, "true": True, "0": False, "false": False}
 
 
@@ -123,6 +125,11 @@ def parse_when(text):
         return None
 
 
+def _short(text):
+    """A cell for an error message, cut so that a huge cell stays readable."""
+    return repr(text if len(text) <= 60 else text[:57] + "...")
+
+
 def parse_int(text):
     return int(text) if _INT.match(text) else None
 
@@ -138,24 +145,34 @@ def _new_set(set_id, row):
     def bit(col):
         value = parse_bit(row[col])
         if value is None:
-            problems.append("%s is %r, not 0 or 1" % (col, row[col]))
+            problems.append("%s is %s, not 0 or 1" % (col, _short(row[col])))
         return value
 
     finish = parse_when(row["backup_finish_date"])
     if finish is None:
-        problems.append("backup_finish_date %r is not yyyy-mm-dd hh:mi:ss"
-                        % row["backup_finish_date"])
+        problems.append("backup_finish_date %s is not yyyy-mm-dd hh:mi:ss"
+                        % _short(row["backup_finish_date"]))
+    server = row["server_name"].strip()
+    database = row["database_name"].strip()
+    if not server:
+        problems.append("server_name is blank")
+    if not database:
+        problems.append("database_name is blank")
+    position = parse_int(row["position"])
+    if position is None:
+        problems.append("position %s is not an integer"
+                        % _short(row["position"]))
     return {
         "id": set_id,
-        "server": row["server_name"].strip(),
-        "database": row["database_name"].strip(),
+        "server": server,
+        "database": database,
         "type": row["type"].strip().upper(),
         "copy_only": bit("is_copy_only"),
         "snapshot": bit("is_snapshot"),
         "damaged": bit("is_damaged"),
         "recovery": row["recovery_model"].strip().upper(),
         "finish": finish,
-        "position": parse_int(row["position"]),
+        "position": position,
         "devices": [],
         "files": [],
         "problems": problems,
@@ -167,35 +184,44 @@ def read_export(text):
 
     The export joins backupset to backupmediafamily, so a striped or mirrored
     set arrives as one row per family. Rows that share a backup_set_id are one
-    set, with every device type and file name they carry.
+    set, with every device type and file name they carry. backup_set_id is
+    unique only inside one msdb, so a set is keyed on (server_name, id).
     """
     reader = csv.DictReader(io.StringIO(text), restval="")
-    reader.fieldnames = [(h or "").strip().lower()
-                         for h in (reader.fieldnames or [])]
-    missing = [c for c in COLUMNS if c not in reader.fieldnames]
-    if missing:
-        raise ColumnError("the export lacks column(s): %s. Run --query for "
-                          "the export this tool reads." % ", ".join(missing))
     sets = {}
     try:
+        # reading fieldnames reads line 1, so it sits inside the try
+        reader.fieldnames = [(h or "").strip().lower()
+                             for h in (reader.fieldnames or [])]
+        missing = [c for c in COLUMNS if c not in reader.fieldnames]
+        if missing:
+            raise ColumnError("the export lacks column(s): %s. Run --query "
+                              "for the export this tool reads."
+                              % ", ".join(missing))
         for row in reader:
             set_id = parse_int(row["backup_set_id"])
             if set_id is None:
-                raise ExportError("line %d: backup_set_id %r is not an integer"
-                                  % (reader.line_num, row["backup_set_id"]))
-            bs = sets.get(set_id)
+                raise ExportError("line %d: backup_set_id %s is not an integer"
+                                  % (reader.line_num,
+                                     _short(row["backup_set_id"])))
+            key = (row["server_name"].strip(), set_id)
+            bs = sets.get(key)
             if bs is None:
-                bs = sets[set_id] = _new_set(set_id, row)
+                bs = sets[key] = _new_set(set_id, row)
             bs["devices"].append(parse_int(row["device_type"]))
             name = row["physical_device_name"].strip()
             if name and name not in bs["files"]:
                 bs["files"].append(name)
     except csv.Error as exc:
         raise ExportError("line %d: %s" % (reader.line_num, exc))
-    return [sets[k] for k in sorted(sets)]
+    return [sets[k] for k in sorted(sets, key=lambda k: (k[1], k[0]))]
 
 
 # ==================================================================== decide
+
+def _key(bs):
+    return (bs["server"], bs["id"])
+
 
 def overwrites(sets):
     """Which sets are gone because a later backup started their file again.
@@ -206,8 +232,9 @@ def overwrites(sets):
     position 2 or later and removes nothing. A later writer with no position
     counts as a restart: unknown is not proof that the earlier set survived.
 
-    Returns (lost, rewrote): lost maps a lost set id to the id that started
-    its file again, and rewrote maps a set id to how many sets it replaced.
+    Returns (lost, rewrote). Both are keyed on (server_name, backup_set_id):
+    lost maps a lost set to the id that started its file again, and rewrote
+    maps a set to how many sets it replaced.
     """
     in_file = {}
     lost = {}
@@ -221,9 +248,9 @@ def overwrites(sets):
             if bs["position"] is None or bs["position"] <= 1:
                 for old in earlier:
                     lost.setdefault(old, bs["id"])
-                rewrote[bs["id"]] = rewrote.get(bs["id"], 0) + len(earlier)
+                rewrote[_key(bs)] = rewrote.get(_key(bs), 0) + len(earlier)
                 del earlier[:]
-            earlier.append(bs["id"])
+            earlier.append(_key(bs))
     return lost, rewrote
 
 
@@ -245,9 +272,9 @@ def refusals(bs, lost, as_of, allow_copy_only=False):
     if bs["damaged"]:
         out.append("damaged: damage was detected and the backup was told to "
                    "continue despite errors")
-    if bs["id"] in lost:
+    if _key(bs) in lost:
         out.append("overwritten: backup set %d later started its file again "
-                   "at position 1" % lost[bs["id"]])
+                   "at position 1" % lost[_key(bs)])
     if bs["finish"] is not None and bs["finish"] > as_of:
         out.append("finishes after the as-of time %s" % _fmt(as_of))
     return out
@@ -282,18 +309,23 @@ def judge(server, database, sets, lost, rewrote, as_of,
                 "restore stops at this full unless a later full or "
                 "differential exists")
         elif bs["recovery"] not in RECOVERY_MODELS:
-            v["warnings"].append("recovery_model %r is not FULL, BULK-LOGGED "
-                                 "or SIMPLE" % bs["recovery"])
+            v["warnings"].append("recovery_model %s is not FULL, BULK-LOGGED "
+                                 "or SIMPLE" % _short(bs["recovery"]))
         if bs["copy_only"]:
             v["warnings"].append(
                 "copy-only, allowed by --allow-copy-only: a differential taken "
                 "after it is based on an older full")
-        if rewrote.get(bs["id"]):
+        if bs["position"] > 1:
+            v["warnings"].append(
+                "the set is at position %d in its file, and a plain RESTORE "
+                "reads position 1: restore it with FILE = %d"
+                % (bs["position"], bs["position"]))
+        if rewrote.get(_key(bs)):
             v["warnings"].append(
                 "this backup started its file again at position 1, so the %d "
                 "earlier set(s) history shows in that file are gone; a fixed "
                 "file name keeps one full, and the next INIT run to that name "
-                "overwrites this one" % rewrote[bs["id"]])
+                "overwrites this one" % rewrote[_key(bs)])
         if v["warnings"]:
             v["status"] = "WARN"
         return v
@@ -307,8 +339,8 @@ def decide(sets, as_of, max_age_hours=DEFAULT_MAX_AGE_HOURS, databases=None,
     The overwrite check runs over the whole export before any filter, because
     a backup of another database to the same file destroys this one too.
     """
-    if not max_age_hours > 0:
-        raise ValueError("the maximum age must be above zero hours")
+    if not 0 < max_age_hours < float("inf"):
+        raise ValueError("the maximum age must be above zero and finite")
     lost, rewrote = overwrites(sets)
     if server is not None:
         sets = [s for s in sets if s["server"] == server]
@@ -386,6 +418,7 @@ def to_record(v):
         "code": v["code"],
         "backup_set_id": bs["id"] if bs else None,
         "backup_finish_date": _fmt(bs["finish"]) if bs else None,
+        "position": bs["position"] if bs else None,
         "files": list(bs["files"]) if bs else [],
         "age_hours": None if v["age_hours"] is None else round(v["age_hours"], 2),
         "warnings": list(v["warnings"]),
@@ -604,7 +637,8 @@ def self_test():
           "and the warning counts the earlier set that is gone")
     lost, rewrote = overwrites(read_export(_csv(
         [_row(20, path=fixed), _row(21, path=fixed), _row(22, path=fixed)])))
-    check(lost == {20: 21, 21: 22} and rewrote == {20: 0, 21: 1, 22: 1},
+    check(lost == {("srv-a", 20): 21, ("srv-a", 21): 22} and
+          rewrote == {("srv-a", 20): 0, ("srv-a", 21): 1, ("srv-a", 22): 1},
           "each INIT run destroys the set before it")
     v = _run([_row(20, path=fixed, finish="2026-10-06 01:00:00"),
               _row(21, btype="L", path=fixed, finish="2026-10-06 02:00:00")])[0]
@@ -687,6 +721,80 @@ def self_test():
           "--strict turns a WARN into exit 1")
     check(gate(_run([good])) == EXIT_PASS and gate(_run([snap])) == EXIT_FAIL,
           "PASS exits 0, FAIL exits 1")
+
+    # ---- one backup_set_id on two servers: ids are unique per msdb only
+    vs = _run([_row(10), _row(10, db="webdb", server="srv-b", snap="1",
+                              dev="7", path="{guid-d}")])
+    check([(x["server"], x["database"], x["status"]) for x in vs] ==
+          [("srv-a", "appdb", "PASS"), ("srv-b", "webdb", "FAIL")],
+          "the same backup_set_id on two servers is two sets, each judged  "
+          "<-- pinned defect")
+    check(vs[0]["chosen"]["files"] == ["D:\\bak\\appdb_10.bak"] and
+          vs[0]["chosen"]["devices"] == [2],
+          "and one server's files and device types never join the other's  "
+          "<-- pinned defect")
+    vs = _run([_row(10), _row(10, server="srv-b", finish="2026-10-01 01:00:00")],
+              server="srv-b")
+    check(len(vs) == 1 and vs[0]["code"] == "STALE",
+          "--server finds the second server's set that shares an id")
+    vs = _run([_row(10, path=fixed), _row(11, path=fixed),
+               _row(10, server="srv-b", path=fixed)])
+    check([(x["server"], x["status"]) for x in vs] ==
+          [("srv-a", "WARN"), ("srv-b", "PASS")] and
+          vs[0]["chosen"]["id"] == 11 and vs[1]["chosen"]["id"] == 10,
+          "an overwrite on one server never marks the same id lost on another  "
+          "<-- pinned defect")
+
+    # ---- order of the input never changes the verdict
+    v = _run([_row(22, path=fixed, finish="2026-10-06 01:00:00"),
+              _row(21, path=fixed, finish="2026-10-05 01:00:00"),
+              _row(20, path=fixed, finish="2026-10-04 01:00:00")])[0]
+    check(v["chosen"]["id"] == 22 and v["warnings"][0].count("the 1 earlier") == 1,
+          "an export in descending backup_set_id order reads the same as "
+          "ascending")
+    check([s["id"] for s in read_export(_csv([_row(22), _row(20), _row(21)]))] ==
+          [20, 21, 22],
+          "read_export returns the sets in ascending backup_set_id order")
+    vs = _run([_row(40, db="zeta"), _row(41, db="alpha")])
+    check([x["database"] for x in vs] == ["alpha", "zeta"],
+          "verdicts list databases in name order, not export order")
+
+    # ---- position
+    v = _run([_row(20, path=fixed, pos="1"), _row(21, path=fixed, pos="2")])[0]
+    check(v["status"] == "WARN" and v["chosen"]["id"] == 21 and
+          "FILE = 2" in v["warnings"][0],
+          "a full appended at position 2 passes as WARN and names FILE = 2  "
+          "<-- pinned defect")
+    check(to_record(v)["position"] == 2,
+          "and the JSON record carries the position")
+    for bad_pos, what in (("", "blank"), ("x", "the letter x"),
+                          ("-", "a lone minus"), ("9" * 5000, "5000 digits")):
+        v = _run([_row(26, pos=bad_pos)])[0]
+        check(v["code"] == "NO-FULL" and
+              "position %s is not an integer" % _short(bad_pos)
+              in v["skipped"][0][1][0],
+              "a full whose position is %s is refused  <-- pinned defect"
+              % what)
+    v = _run([_row(26, server="", db="")])[0]
+    check(v["code"] == "NO-FULL" and
+          v["skipped"][0][1][:2] == ["server_name is blank",
+                                     "database_name is blank"],
+          "a blank server_name or database_name refuses the row  "
+          "<-- pinned defect")
+    check(parse_int("9" * 5000) is None and parse_int("9" * 18) is not None,
+          "an integer field longer than 18 digits is unreadable, never "
+          "int()'d")
+    exc = _caught(lambda: read_export(_csv([dict(good, backup_set_id="9" * 5000)])))
+    check(isinstance(exc, ExportError) and "line 2" in str(exc) and
+          len(str(exc)) < 120,
+          "a 5000 digit backup_set_id is a short ExportError, not a traceback  "
+          "<-- pinned defect")
+    exc = _caught(lambda: read_export("x" * 200000 + "\n"))
+    check(isinstance(exc, ExportError) and "line" in str(exc),
+          "an oversize header field is an ExportError, not a csv.Error  "
+          "<-- pinned defect")
+    raises(lambda: _run([good], max_age_hours=float("inf")),
+           "an infinite maximum age raises")
 
     # ---- reading the export
     hdr = ["  Backup_Set_Id "] + [c.upper() for c in COLUMNS[1:]] + ["extra"]
@@ -819,6 +927,24 @@ def self_test():
         code, out, err = _cli([ids])
         check(code == 2 and "not an integer" in err,
               "an export with a non-integer set id exits 2")
+        uni = os.path.join(tmp, "uni.csv")
+        with io.open(uni, "w", encoding="utf-8", newline="") as fh:
+            fh.write(_csv([_row(10, path=u"D:\\bak\\\u0141\u00f3d\u017a.bak")]))
+        narrow = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+        narrow_err = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+        saved = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = narrow, narrow_err
+        try:
+            code = main([uni, "--as-of", "2026-10-06 20:00:00"])
+            main([os.path.join(tmp, "\u0141.csv")])
+        finally:
+            sys.stdout, sys.stderr = saved
+        narrow.flush()
+        narrow_err.flush()
+        check(code == 0 and b"\\u0141\\xf3d\\u017a.bak" in narrow.buffer.getvalue()
+              and b"\\u0141.csv" in narrow_err.buffer.getvalue(),
+              "a name outside the console code page prints as an escape, "
+              "never a traceback  <-- pinned defect")
         code, out, err = _cli([path])
         check(code in (0, 1) and out.startswith(
             "as of %s" % datetime.datetime.now().strftime("%Y-%m-%d")),
@@ -827,6 +953,10 @@ def self_test():
     check(code == 64 and "--as-of" in err, "an unreadable --as-of exits 64")
     code, out, err = _cli(["x.csv", "--max-age-hours", "0"])
     check(code == 64, "--max-age-hours 0 exits 64")
+    code, out, err = _cli(["x.csv", "--max-age-hours", "inf"])
+    check(code == 64 and "finite" in err,
+          "--max-age-hours inf exits 64, so no Infinity reaches the JSON  "
+          "<-- pinned defect")
     code, out, err = _cli([])
     check(code == 64 and "export CSV" in err, "no export at all exits 64")
     code, out, err = _cli(["--query"])
@@ -848,7 +978,7 @@ def self_test():
     probe = importlib.util.module_from_spec(spec)
     buf, saved = io.StringIO(), sys.stdout
     sys.stdout, no_pyc = buf, sys.dont_write_bytecode
-    sys.dont_write_bytecode = True  # the self-test writes nothing to disk
+    sys.dont_write_bytecode = True  # the probe import leaves no .pyc behind
     try:
         spec.loader.exec_module(probe)
     finally:
@@ -955,6 +1085,10 @@ def _usage(msg):
 
 
 def main(argv=None):
+    # A name outside the console code page must print, not crash with exit 1.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     args = _parse(sys.argv[1:] if argv is None else argv)
     if args.self_test:
         return self_test()
@@ -964,8 +1098,8 @@ def main(argv=None):
     if not args.export:
         return _usage("an export CSV is required. Run --query for the T-SQL "
                       "that produces it, or --self-test.")
-    if not args.max_age_hours > 0:
-        return _usage("--max-age-hours must be above zero.")
+    if not 0 < args.max_age_hours < float("inf"):
+        return _usage("--max-age-hours must be above zero and finite.")
     if args.apply and not args.out:
         return _usage("--apply needs --out.")
     if args.as_of is None:
